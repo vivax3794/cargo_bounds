@@ -2,6 +2,8 @@
 name = "cargo-bounds"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Find and test dependency versions bounds."
 
 [dependencies]
 anyhow = { version = "1.0.14" }
