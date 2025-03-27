@@ -1,34 +1,51 @@
 #![feature(exit_status_error)]
 
 use std::{
+    env::args_os,
     fs,
+    io::{BufRead, BufReader},
     process::{Command, Stdio},
     time::Duration,
 };
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use indicatif::ProgressStyle;
 use owo_colors::OwoColorize;
 use toml_edit::DocumentMut;
 
-#[derive(Parser, Debug)]
-/// Test the current range
+#[derive(Parser, Debug, Default)]
 struct TestConfig {
+    /// Test minor versions as well.
     #[arg(short, long)]
     minor: bool,
+    /// Test patch versions as well (implies `--minor`)
     #[arg(short, long)]
     patch: bool,
+    /// Print the versions that arent tested
     #[arg(short = 's', long)]
     print_skiped: bool,
+    /// Test a specific dependency
     #[arg(short, long)]
     dep: Option<String>,
+    /// Overwrite the check command (DEFAULT: "cargo check --all-features")
+    #[arg(short, long)]
+    command: Option<String>,
 }
 
-/// Test dep ranges
 #[derive(Parser, Debug)]
+#[command(bin_name("cargo bounds"))]
 enum Cli {
+    /// Test if your current depedency bounds are valid.
     Test(TestConfig),
-    Minimize { dep: Option<String> },
+    /// Find the most flexible range you could support
+    Minimize {
+        /// Minimize a specific dependency
+        dep: Option<String>,
+        /// Skip the sanity check
+        #[arg(short, long)]
+        skip_sanity: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -57,7 +74,12 @@ impl Drop for State {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut arguments = args_os().collect::<Vec<_>>();
+    if arguments[1].to_string_lossy() == "bounds" {
+        arguments.remove(1);
+    }
+
+    let cli = Cli::parse_from(arguments);
 
     let prev_state = State::store()?;
     let cloned_state = prev_state.clone();
@@ -73,10 +95,6 @@ fn main() -> Result<()> {
 
 #[inline]
 fn main_impl(state: &State, cli: Cli) -> Result<()> {
-    match run_test(format!("{}", "baseline".red()))? {
-        TestResult::Fail => return Err(anyhow!("Baseline failed")),
-        TestResult::Sucess => {}
-    }
     match cli {
         Cli::Test(mut test) => {
             if test.patch {
@@ -89,11 +107,11 @@ fn main_impl(state: &State, cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
-        Cli::Minimize { dep } => minimize(state, dep),
+        Cli::Minimize { dep, skip_sanity } => minimize(state, dep, skip_sanity),
     }
 }
 
-fn minimize(state: &State, dep: Option<String>) -> Result<()> {
+fn minimize(state: &State, dep: Option<String>, skip_sanity: bool) -> Result<()> {
     let cargo_toml = state.cargo_toml.parse::<DocumentMut>()?;
     let Some(deps) = cargo_toml.get("dependencies") else {
         println!("{}", "No dependencies".bright_red());
@@ -107,11 +125,11 @@ fn minimize(state: &State, dep: Option<String>) -> Result<()> {
         if !deps.contains_key(&dep) {
             return Err(anyhow!("dep {dep} not found."));
         }
-        minimize_dep(state, &dep)?;
+        minimize_dep(state, &dep, skip_sanity)?;
     } else {
         let deps = deps.iter().map(|(key, _)| key).collect::<Vec<_>>();
         for dep in deps {
-            minimize_dep(state, dep)?;
+            minimize_dep(state, dep, skip_sanity)?;
         }
     }
     Ok(())
@@ -202,7 +220,8 @@ fn sanity_test_dep(state: &State, dep: &str, config: &TestConfig) -> Result<u16>
     let mut fails = 0;
     for version in versions {
         if version.major == last_major
-            && (!config.minor || (last_minor == version.minor && !config.patch))
+            && ((!config.minor && version.major != 0)
+                || (last_minor == version.minor && !config.patch))
             && version != last_version
         {
             if config.print_skiped {
@@ -214,7 +233,7 @@ fn sanity_test_dep(state: &State, dep: &str, config: &TestConfig) -> Result<u16>
         last_minor = version.minor;
         last_major = version.major;
 
-        if let TestResult::Fail = test_version(&mut cargo_toml, dep, version)? {
+        if let TestResult::Fail = test_version(&mut cargo_toml, dep, version, config)? {
             fails += 1;
         }
     }
@@ -222,7 +241,7 @@ fn sanity_test_dep(state: &State, dep: &str, config: &TestConfig) -> Result<u16>
     Ok(fails)
 }
 
-fn minimize_dep(state: &State, dep: &str) -> Result<()> {
+fn minimize_dep(state: &State, dep: &str, skip_sanity: bool) -> Result<()> {
     let mut cargo_toml = state.cargo_toml.parse::<DocumentMut>()?;
     let deps = cargo_toml
         .get_mut("dependencies")
@@ -286,7 +305,35 @@ fn minimize_dep(state: &State, dep: &str) -> Result<()> {
     println!("  Found max {}", max_version.green());
 
     let bound = semver::VersionReq::parse(&format!(">={min_version}, <={max_version}"))?;
-    println!("  {}", bound.green());
+    if skip_sanity {
+        println!("  {}", bound.green());
+        return Ok(());
+    }
+    println!("  {} - doing sanity check", bound.green());
+    let mut started = false;
+    let mut last_combo = (u64::MAX, u64::MAX);
+    for version in versions {
+        if version == min_version {
+            started = true;
+        }
+
+        if started {
+            if last_combo == (version.major, version.minor) {
+                continue;
+            }
+
+            test_version(
+                &mut cargo_toml,
+                dep,
+                version.clone(),
+                &TestConfig::default(),
+            )?;
+            last_combo = (version.major, version.minor);
+            if version == max_version {
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -301,7 +348,12 @@ fn binary_search(
 
     while top - low > 1 {
         let center = (low + top) / 2;
-        let res = test_version(cargo_toml, dep, versions[center].clone())?;
+        let res = test_version(
+            cargo_toml,
+            dep,
+            versions[center].clone(),
+            &TestConfig::default(),
+        )?;
 
         if res == upper_kind {
             top = center;
@@ -310,8 +362,18 @@ fn binary_search(
         }
     }
 
-    let low_res = test_version(cargo_toml, dep, versions[low].clone())?;
-    let top_res = test_version(cargo_toml, dep, versions[top].clone())?;
+    let low_res = test_version(
+        cargo_toml,
+        dep,
+        versions[low].clone(),
+        &TestConfig::default(),
+    )?;
+    let top_res = test_version(
+        cargo_toml,
+        dep,
+        versions[top].clone(),
+        &TestConfig::default(),
+    )?;
 
     if low_res == top_res {
         if upper_kind == TestResult::Fail {
@@ -332,46 +394,54 @@ fn test_version(
     cargo_toml: &mut DocumentMut,
     dep: &str,
     version: semver::Version,
+    config: &TestConfig,
 ) -> Result<TestResult> {
     cargo_toml["dependencies"][dep]["version"] = format!("={version}").into();
     fs::write("Cargo.toml", cargo_toml.to_string())?;
-    run_test(version.blue().to_string())
+    run_test(version.blue().to_string(), config)
 }
 
-fn run_test(msg: String) -> Result<TestResult> {
-    let spinner = indicatif::ProgressBar::new_spinner().with_message(msg.clone());
+fn run_test(msg: String, config: &TestConfig) -> Result<TestResult> {
+    let spinner = indicatif::ProgressBar::new_spinner().with_style(
+        ProgressStyle::with_template(&format!("{{spinner:.cyan}} {msg} {{msg}}",))
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+    );
     spinner.enable_steady_tick(Duration::from_millis(100));
-    let res = test_inner()?;
+
+    let mut command;
+    if let Some(custom_command) = &config.command {
+        command = Command::new("bash");
+        command.arg("-c").arg(custom_command);
+    } else {
+        command = Command::new("cargo");
+        command.arg("check");
+        command.arg("--all-features");
+        command.arg("--color");
+        command.arg("always");
+    }
+
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child.stderr.take().unwrap();
+
+    for line in BufReader::new(stderr).lines() {
+        spinner.set_message(line.unwrap());
+    }
+
+    let res = match child.wait()?.exit_ok() {
+        Ok(_) => TestResult::Sucess,
+        Err(_) => TestResult::Fail,
+    };
 
     let res_text = match res {
         TestResult::Fail => "FAILED".red().to_string(),
         TestResult::Sucess => "OK".green().to_string(),
     };
-    spinner.finish_with_message(format!("{msg} {res_text}"));
+    spinner.finish_with_message(res_text);
     Ok(res)
-}
-
-fn test_inner() -> Result<TestResult> {
-    match Command::new("cargo")
-        .arg("update")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?
-        .exit_ok()
-    {
-        Ok(_) => {}
-        Err(_) => return Ok(TestResult::Fail),
-    }
-    match Command::new("cargo")
-        .arg("check")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?
-        .exit_ok()
-    {
-        Ok(_) => Ok(TestResult::Sucess),
-        Err(_) => Ok(TestResult::Fail),
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
