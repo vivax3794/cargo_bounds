@@ -202,7 +202,10 @@ fn sanity_test_dep(state: &State, dep: &str, config: &TestConfig) -> Result<u16>
         let ver = dep_item
             .as_table_like()
             .ok_or(anyhow!("Unexpected dep type"))?;
-        let ver = ver.get("version").ok_or(anyhow!("Expected version key"))?;
+        let Some(ver) = ver.get("version") else {
+            println!("{} {}", "No version info found for".yellow(), dep.green());
+            return Ok(0);
+        };
         let ver = ver.as_str().ok_or(anyhow!("Expected str"))?;
         bound = semver::VersionReq::parse(ver)?;
     }
