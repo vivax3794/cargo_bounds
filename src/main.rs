@@ -217,7 +217,10 @@ fn sanity_test_dep(state: &State, dep: &str, config: &TestConfig) -> Result<u16>
     let mut last_major = u64::MAX;
     let mut last_minor = u64::MAX;
 
-    let last_version = versions.last().unwrap().clone();
+    let last_version = versions
+        .last()
+        .ok_or(anyhow!("No versions in bound"))?
+        .clone();
     let mut fails = 0;
     for version in versions {
         if version.major == last_major
@@ -428,8 +431,11 @@ fn run_test(msg: String, config: &TestConfig) -> Result<TestResult> {
         .spawn()?;
     let stderr = child.stderr.take().unwrap();
 
-    for line in BufReader::new(stderr).lines() {
-        spinner.set_message(line.unwrap());
+    let mut output = String::new();
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        output.push_str(&line);
+        output.push('\n');
+        spinner.set_message(line);
     }
 
     let res = match child.wait()?.success() {
@@ -442,6 +448,9 @@ fn run_test(msg: String, config: &TestConfig) -> Result<TestResult> {
         TestResult::Sucess => "OK".green().to_string(),
     };
     spinner.finish_with_message(res_text);
+    if res == TestResult::Fail {
+        println!("{output}");
+    }
     Ok(res)
 }
 
