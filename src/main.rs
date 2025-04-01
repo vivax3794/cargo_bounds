@@ -1,10 +1,8 @@
-#![feature(exit_status_error)]
-
 use std::{
     env::args_os,
     fs,
     io::{BufRead, BufReader},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -434,9 +432,9 @@ fn run_test(msg: String, config: &TestConfig) -> Result<TestResult> {
         spinner.set_message(line.unwrap());
     }
 
-    let res = match child.wait()?.exit_ok() {
-        Ok(_) => TestResult::Sucess,
-        Err(_) => TestResult::Fail,
+    let res = match child.wait()?.success() {
+        true => TestResult::Sucess,
+        false => TestResult::Fail,
     };
 
     let res_text = match res {
